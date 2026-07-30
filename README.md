@@ -17,6 +17,18 @@ and nothing else — no LLM SDK, no templating engine, no vector store.
 ## Install
 
 ```bash
+pip install agent-harnessed
+```
+
+The distribution is published as `agent-harnessed`; the import name is `agent_harness`:
+
+```python
+from agent_harness import LoopController, ToolGateway
+```
+
+For local development:
+
+```bash
 pip install -e ".[dev]"
 ```
 

@@ -6,3 +6,6 @@ dist/
 .pytest_cache/
 .venv/
 venv/
+
+# local design notes, not published
+agent-harness-spec.md

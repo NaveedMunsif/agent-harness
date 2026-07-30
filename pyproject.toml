@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-harness"
-version = "0.1.0"
+name = "agent-harnessed"
+dynamic = ["version"]
 description = "A runtime environment that coordinates context, memory, prompts, tools, guardrails, output formatting, and a bounded reasoning loop around an LLM."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,6 +25,25 @@ dependencies = ["pydantic>=2.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://github.com/NaveedMunsif/agent-harness"
+Repository = "https://github.com/NaveedMunsif/agent-harness"
+Issues = "https://github.com/NaveedMunsif/agent-harness/issues"
+
+[tool.hatch.version]
+path = "src/agent_harness/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+# Explicit allowlist. Keeps local notes and editor/tool config out of releases.
+include = [
+    "src/agent_harness",
+    "tests",
+    "examples",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_harness"]
