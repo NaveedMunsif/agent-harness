@@ -1,5 +1,13 @@
 # agent-harness
 
+[![PyPI](https://img.shields.io/pypi/v/agent-harnessed.svg)](https://pypi.org/project/agent-harnessed/)
+[![Python](https://img.shields.io/pypi/pyversions/agent-harnessed.svg)](https://pypi.org/project/agent-harnessed/)
+[![License: MIT](https://img.shields.io/pypi/l/agent-harnessed.svg)](https://github.com/NaveedMunsif/agent-harness/blob/main/LICENSE)
+
+```bash
+pip install agent-harnessed
+```
+
 A clean, async-first Python library that provides the **runtime environment around an LLM**.
 
 ```
@@ -16,15 +24,14 @@ and nothing else — no LLM SDK, no templating engine, no vector store.
 
 ## Install
 
-```bash
-pip install agent-harnessed
-```
-
 The distribution is published as `agent-harnessed`; the import name is `agent_harness`:
 
 ```python
 from agent_harness import LoopController, ToolGateway
 ```
+
+New here? [**GETTING_STARTED.md**](https://github.com/NaveedMunsif/agent-harness/blob/main/GETTING_STARTED.md)
+walks from an empty folder to a real agent calling your own tool, in about ten minutes.
 
 For local development:
 
@@ -193,8 +200,48 @@ value. And there is no separate tool-history channel: the `ToolResult` is folded
 `context.episodic`, so iteration 2 sees the evidence through the ordinary history
 section.
 
-See [`examples/order_tracking.py`](examples/order_tracking.py) for the fuller version,
+See [`examples/order_tracking.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/order_tracking.py) for the fuller version,
 including a forced stop.
+
+## Connecting a real model
+
+The `call_llm` above is a fake — useful for understanding the loop, useless in production.
+[`examples/claude_adapter.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/claude_adapter.py) is the same agent wired to
+Claude through the Anthropic SDK, and it is the whole translation layer:
+
+| The model does this | The adapter returns |
+| --- | --- |
+| emits a `tool_use` block | `TurnStepType.TOOL_CALL` |
+| calls the `ask_user` tool | `TurnStepType.CLARIFICATION` |
+| replies with text only | `TurnStepType.FINAL` |
+
+`ask_user` is a **sentinel**: declared to the model as an ordinary tool, never registered
+with the `ToolGateway`. The adapter intercepts it, so the model asks a question through
+the same native tool-calling channel it uses to act — no parsing prose to guess whether
+an answer was really a question.
+
+Tool schemas are derived from the same `list[Tool]` you hand the gateway, so the two
+definitions cannot drift:
+
+```python
+from anthropic import AsyncAnthropic
+
+controller = LoopController(
+    ...,
+    tool_gateway=ToolGateway([lookup]),
+    call_llm=make_call_llm(AsyncAnthropic(), tools=[lookup]),
+)
+```
+
+```bash
+pip install agent-harnessed anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+python examples/claude_adapter.py
+```
+
+Nothing about this is Claude-specific beyond the SDK call itself. Any model with native
+tool calling maps the same three ways; a model without it needs the adapter to parse a
+structured response instead.
 
 ## Clarification: a return, not a suspension
 
@@ -233,7 +280,7 @@ Because the intent matches and no entity conflicts, that second turn is a
 conflicting `order_id`, so the frame is rebuilt via `TaskFrame.fresh()` with
 `is_pivot=True` — dropping the abandoned task's plan and in-flight tool ids.
 
-See [`examples/clarification_flow.py`](examples/clarification_flow.py) for all three
+See [`examples/clarification_flow.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/clarification_flow.py) for all three
 turns end to end.
 
 ## What the episodic record looks like
