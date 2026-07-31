@@ -68,7 +68,11 @@ class PromptCompiler:
             )
         if frame.active_plan:
             frame_lines.append("plan: " + " -> ".join(frame.active_plan))
-        if context.is_pivot:
+        # Only a pivot *away from something* is a topic change. A fresh frame
+        # built because the session just started has no earlier topic to have
+        # left, and saying otherwise tells the model something untrue on the
+        # opening message of every conversation.
+        if context.is_pivot and context.had_prior_frame:
             frame_lines.append("note: the user changed topic; earlier task state was dropped.")
         sections["task_frame"] = "\n".join(frame_lines)
 
