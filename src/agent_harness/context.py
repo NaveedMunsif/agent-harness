@@ -36,6 +36,14 @@ class ScopedContext(BaseModel):
     episodic: list[str] = Field(default_factory=list)
     procedural: list[str] = Field(default_factory=list)
     is_pivot: bool = False
+    had_prior_frame: bool = False
+    """Whether :meth:`ContextEngine.build` was given a ``current_frame``.
+
+    ``is_pivot`` alone cannot distinguish "the user changed topic" from "this is
+    the opening message of a session" -- both build a fresh frame, so both set
+    it. Pairing the two separates them: ``is_pivot and had_prior_frame`` is a
+    real topic change, and is the only case worth telling the model about.
+    """
 
 
 class ContextEngine:
@@ -114,4 +122,5 @@ class ContextEngine:
             episodic=[record.content for record in episodic],
             procedural=[record.content for record in procedural],
             is_pivot=is_pivot,
+            had_prior_frame=current_frame is not None,
         )

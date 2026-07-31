@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from agent_harness import MemoryKind, MemoryStore, ScopedContext, TaskFrame
+from agent_harness import (
+    MemoryKind,
+    MemoryStore,
+    PromptCompiler,
+    ScopedContext,
+    TaskFrame,
+)
 from conftest import SESSION, KeywordContextEngine, RecordingBackend
 
 
@@ -173,6 +179,61 @@ async def test_build_on_a_conflicting_entity_pivots_even_with_the_same_intent():
     assert context.is_pivot is True
     assert context.task_frame.entities == {"order": "B-2"}
     assert context.task_frame.active_plan == []
+
+
+# ------------------------------------------- the topic-change note in the prompt
+
+
+TOPIC_NOTE = "note: the user changed topic"
+
+
+async def test_first_turn_is_a_pivot_but_had_no_prior_frame():
+    ctx_engine, _ = engine()
+
+    context = await ctx_engine.build(SESSION, "track order=A-1", None)
+
+    # A fresh frame was built, but not *away from* anything.
+    assert context.is_pivot is True
+    assert context.had_prior_frame is False
+
+
+async def test_a_real_pivot_had_a_prior_frame():
+    ctx_engine, _ = engine()
+
+    context = await ctx_engine.build(SESSION, "refund order=A-1", frame())
+
+    assert context.is_pivot is True
+    assert context.had_prior_frame is True
+
+
+async def test_opening_message_is_not_told_the_topic_changed():
+    """The bug: every session's first prompt claimed the user changed topic."""
+    ctx_engine, _ = engine()
+    context = await ctx_engine.build(SESSION, "track order=A-1", None)
+
+    compiled = PromptCompiler(role="r").compile(context, [], "track order=A-1")
+
+    assert TOPIC_NOTE not in compiled.sections["task_frame"]
+    assert TOPIC_NOTE not in compiled.render()
+
+
+async def test_an_actual_topic_change_still_says_so():
+    ctx_engine, _ = engine()
+    context = await ctx_engine.build(SESSION, "refund order=A-1", frame())
+
+    compiled = PromptCompiler(role="r").compile(context, [], "refund order=A-1")
+
+    assert TOPIC_NOTE in compiled.sections["task_frame"]
+
+
+async def test_a_continuation_never_says_so():
+    ctx_engine, _ = engine()
+    context = await ctx_engine.build(SESSION, "track carrier=ups", frame())
+
+    compiled = PromptCompiler(role="r").compile(context, [], "track carrier=ups")
+
+    assert context.is_pivot is False
+    assert TOPIC_NOTE not in compiled.sections["task_frame"]
 
 
 async def test_build_populates_each_memory_kind():

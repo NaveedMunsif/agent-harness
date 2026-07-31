@@ -317,9 +317,10 @@ cut short. A resolved turn never loses that granularity either: the consolidated
 pytest
 ```
 
-94 tests covering tool authorization/redaction/rate-limiting, pivot-vs-continuation
+99 tests covering tool authorization/redaction/rate-limiting, pivot-vs-continuation
 semantics and the `fresh()`/`merged_with()` branch in `ContextEngine.build`, all three
 loop exits, every forced stop (including that already-executed `ToolResult`s survive
 one), guardrail violations converting to clean results at each stage, `LLMTurnStep`
 validation rejecting malformed steps, repeated-call detection over non-JSON-native
-arguments, and the per-stage guardrail payload contract.
+arguments, the per-stage guardrail payload contract, and that the topic-change note
+reaches the prompt on a real pivot but never on a session's opening message.
