@@ -293,11 +293,9 @@ For a model without native tool calling, have the adapter ask for JSON and parse
 
 ## Where to go next
 
-- [`examples/claude_adapter.py`](examples/claude_adapter.py) — the production-shaped
-  version of this adapter: an `ask_user` sentinel tool for clarifications, an OUTPUT
-  guardrail that blocks ungrounded claims, refusal handling, and schemas derived from
-  your `Tool` list so the two definitions cannot drift
-- [`examples/clarification_flow.py`](examples/clarification_flow.py) — asking a question
-  and resuming with the same `TaskFrame`
+- [`examples/refund_agent.py`](examples/refund_agent.py) — the production-shaped
+  version of everything here: a real database, an LLM intent classifier, three
+  independent protections on a side effect that costs money, and `--trace` to see
+  which stage of the pipeline stopped a turn
 - [README](README.md) — module-by-module architecture, the three loop exits, and the
   guardrail payload contract

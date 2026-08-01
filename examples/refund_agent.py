@@ -39,10 +39,10 @@ enough; you read it together with ``tool_results``.
     export ANTHROPIC_API_KEY=sk-ant-...      # setx on Windows
 
     python examples/refund_agent.py          # interactive
-    python examples/refund_agent.py --demo   # the four scenarios
+    python examples/refund_agent.py --demo   # every scenario in sequence
 
-As in ``sqlite_agent.py``, the model never writes SQL. It picks a tool and
-supplies a value; every statement in this file is parameterized and lives here.
+The model never writes SQL. It picks a tool and supplies a value; every statement
+in this file is parameterized and lives here.
 """
 
 from __future__ import annotations
@@ -751,7 +751,7 @@ SCENARIOS = [
 
 
 async def run_demo(client: AsyncAnthropic) -> None:
-    """Run the four scenarios, each in its own session and its own controller.
+    """Run every scenario, each in its own session and its own controller.
 
     A fresh controller per scenario keeps them independent: one scenario's spent
     ``max_calls_per_session`` budget or accumulated memory must not decide the

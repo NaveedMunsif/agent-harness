@@ -191,34 +191,50 @@ the work:
 | calls the `ask_user` tool | `TurnStepType.CLARIFICATION` |
 | replies with text only | `TurnStepType.FINAL` |
 
-`ask_user` is a **sentinel**: declared to the model as an ordinary tool, never
-registered with the `ToolGateway`. The adapter intercepts it, so the model asks a
-question through the same native tool-calling channel it uses to act — no parsing
-prose to guess whether an answer was really a question. See
-[`examples/claude_adapter.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/claude_adapter.py).
-
 Tool schemas are derived from the same `list[Tool]` handed to the gateway, so what
 the model is told about and what the gateway will actually run cannot drift apart.
+
+The middle row is worth a note. `ask_user` is a **sentinel**: declared to the model
+as an ordinary tool but never registered with the `ToolGateway`, so the adapter
+intercepts the call rather than executing it. That lets the model ask a question
+through the same native tool-calling channel it uses to act, instead of you parsing
+its prose to guess whether an answer was really a question.
 
 Nothing here is Claude-specific beyond the SDK call. Any model with native tool
 calling maps the same three ways; one without it needs the adapter to parse a
 structured response instead.
 
-## Examples
+## The example
 
 ```bash
 python examples/refund_agent.py --session naveed --trace
 ```
 
-| File | What it shows |
-| --- | --- |
-| [`refund_agent.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/refund_agent.py) | **Start here.** Money on the line: three independent protections on a refund, an LLM intent classifier, and `--trace` printing every stage of the pipeline and where a turn stopped. |
-| [`sqlite_agent.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/sqlite_agent.py) | The smallest real agent — a model, a database, two tools. No intents, no guardrails, no subclassing. |
-| [`claude_adapter.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/claude_adapter.py) | The translation layer on its own, including the `ask_user` sentinel and refusal handling. |
-| [`order_tracking.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/order_tracking.py) | The loop with **no API key** — a local function stands in for the model, so you can watch redaction, memory write-back and a forced stop for free. |
+[`examples/refund_agent.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/refund_agent.py)
+is a refund agent over SQLite — the first thing in a support agent that can
+actually cost money. Three independent mechanisms stand between the model's
+proposal and a debited account: ownership via `Tool.authorize`, a $500 ceiling as
+a TOOL guardrail, and an atomic conditional `UPDATE` capped by
+`max_calls_per_session`. Each stops a different request at a different stage.
 
-In none of them does the model write SQL. It names a tool and supplies a value;
-every statement is parameterized and lives in your code.
+`--trace` prints which stages a turn passed through before it stopped, so the
+pipeline is something you read rather than infer:
+
+```
+PASS  input guardrail    input-size: passed
+  ->  context            intent=refund_order entities={'order_id': 'A-1007'}
+  ->  state              fresh frame (pivot -- earlier task dropped)
+  ->  memory             recalled 1 semantic, 1 procedural, 0 episodic
+  ->  prompt             v1.0.0, 6 sections: task_frame, known_facts, procedures...
+  ->  model              turn 1: proposes issue_refund(order_id=A-1007)
+STOP  tool guardrail     refund-ceiling: refund of $800.00 exceeds the $500.00 limit
+  ->  memory             wrote episodic: guardrail_violation
+  ==  stopped            guardrail_violation:tool
+```
+
+The model never writes SQL. It names a tool and supplies a value; every statement
+is parameterized and lives in your code. And note the second-to-last line — a
+blocked turn still writes its audit record.
 
 ## Clarification: a return, not a suspension
 
@@ -249,8 +265,7 @@ Because the intent matches and no entity conflicts, that second turn is a
 conflicting `order_id`, so the frame is rebuilt via `TaskFrame.fresh()` with
 `is_pivot=True` — dropping the abandoned task's plan and in-flight tool ids.
 
-See [`examples/clarification_flow.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/clarification_flow.py) for all three
-turns end to end.
+Running the example with `--trace` shows which of the two happened on every turn.
 
 ## What the episodic record looks like
 

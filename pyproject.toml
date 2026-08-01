@@ -25,8 +25,8 @@ dependencies = ["pydantic>=2.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
-# Only needed to run examples/claude_adapter.py. The library itself ships no
-# model client -- see "Connecting a real model" in the README.
+# Only needed to run examples/refund_agent.py. The library itself ships no model
+# client -- you inject one, as the README's quickstart shows.
 examples = ["anthropic>=0.40"]
 
 [project.urls]
