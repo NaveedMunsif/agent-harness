@@ -10,3 +10,4 @@ venv/
 # local design notes, not published
 agent-harness-spec.md
 examples/shop.db
+examples/refunds.db

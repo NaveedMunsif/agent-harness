@@ -84,130 +84,106 @@ A violation never reaches your process: `LoopController` catches `GuardrailViola
 records it, and returns a clean `LoopResult` with `final_text=None`. Output guardrails
 must fail safe when evidence is missing, not crash the caller.
 
-## Order tracking: tool call → final answer
+## A complete agent, wired to a real model
 
-Runnable as-is — no API key, no network.
+An order-support agent over Claude. Everything below is the whole program.
+
+```bash
+pip install agent-harnessed anthropic
+export ANTHROPIC_API_KEY=sk-ant-...      # setx on Windows
+```
 
 ```python
 import asyncio
 
+from anthropic import AsyncAnthropic
+
 from agent_harness import (
-    ContextEngine, Guardrail, GuardrailPipeline, GuardrailStage, GuardrailViolation,
-    InMemoryBackend, LLMTurnStep, LoopController, LoopLimits, MemoryStore,
-    PlainTextFormatter, PromptCompiler, Tool, ToolGateway, TurnStepType,
+    ContextEngine, GuardrailPipeline, InMemoryBackend, LLMTurnStep, LoopController,
+    MemoryStore, PromptCompiler, Tool, ToolGateway, TurnStepType,
 )
 
 ORDERS = {"A-1001": {"status": "shipped", "carrier": "UPS", "eta": "2026-08-03"}}
 
 
-# --- a tool: the gateway authorizes, rate-limits and redacts around this -------
 async def lookup_order(session_id: str, arguments: dict) -> dict:
-    order_id = arguments["order_id"]
-    # internal_note is returned by the backend but never allowed out.
-    return {"order_id": order_id, **ORDERS[order_id], "internal_note": "flagged for QA"}
+    return ORDERS[str(arguments["order_id"]).upper()]
 
 
 lookup = Tool(
     name="lookup_order",
-    description="Look up an order's status by id.",
+    description="Look up an order's status by its id, e.g. A-1001.",
     parameters=["order_id"],
     execute=lookup_order,
     read_only=True,
-    max_calls_per_session=5,
-    redact_fields=["internal_note"],
 )
 
 
-# --- a guardrail: no shipping claims without a successful lookup ---------------
-def require_evidence(payload: tuple) -> None:
-    text, results = payload
-    if not any(result.ok for result in results):
-        raise GuardrailViolation(GuardrailStage.OUTPUT, "claim with no tool evidence")
+def make_call_llm(client: AsyncAnthropic, tools: list[Tool]):
+    """The only piece this library leaves to you: prompt in, LLMTurnStep out."""
+    schemas = [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": {
+                "type": "object",
+                "properties": {p: {"type": "string"} for p in tool.parameters},
+                "required": list(tool.parameters),
+            },
+        }
+        for tool in tools
+    ]
 
-
-# --- context: resolving the order number is what makes pivots precise ----------
-class SupportContext(ContextEngine):
-    async def extract_intent(self, message: str) -> tuple[str, dict]:
-        entities = {"order_id": "A-1001"} if "A-1001" in message else {}
-        return "track_order", entities
-
-
-# --- your model client goes here: async (CompiledPrompt) -> LLMTurnStep --------
-async def call_llm(prompt) -> LLMTurnStep:
-    if "tool lookup_order succeeded" in prompt.sections.get("history", ""):
-        return LLMTurnStep(step_type=TurnStepType.FINAL, text="Order A-1001 has shipped via UPS.")
-    if "order_id" not in prompt.sections.get("task_frame", ""):
-        return LLMTurnStep(
-            step_type=TurnStepType.CLARIFICATION, text="Which order number should I look up?"
+    async def call_llm(prompt) -> LLMTurnStep:
+        response = await client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=16000,
+            messages=[{"role": "user", "content": prompt.render()}],
+            tools=schemas,
         )
-    return LLMTurnStep(
-        step_type=TurnStepType.TOOL_CALL,
-        tool_name="lookup_order",
-        tool_arguments={"order_id": "A-1001"},
-    )
+        for block in response.content:
+            if block.type == "tool_use":
+                return LLMTurnStep(
+                    step_type=TurnStepType.TOOL_CALL,
+                    tool_name=block.name,
+                    tool_arguments=dict(block.input),
+                )
+        text = "".join(b.text for b in response.content if b.type == "text")
+        return LLMTurnStep(step_type=TurnStepType.FINAL, text=text.strip())
 
-
-def build_controller(backend: InMemoryBackend) -> LoopController:
-    memory = MemoryStore(backend)
-    guardrails = GuardrailPipeline()
-    guardrails.add(Guardrail("evidence", GuardrailStage.OUTPUT, require_evidence))
-
-    return LoopController(
-        context_engine=SupportContext(memory),
-        prompt_compiler=PromptCompiler(role="You are a concise order-support agent."),
-        tool_gateway=ToolGateway([lookup]),
-        guardrails=guardrails,
-        memory=memory,
-        call_llm=call_llm,
-        output_formatter=PlainTextFormatter(),
-    )
+    return call_llm
 
 
 async def main() -> None:
-    backend = InMemoryBackend()
-    controller = build_controller(backend)
-
-    result = await controller.handle_turn(
-        "session-1", "Where is order A-1001?", limits=LoopLimits(max_tool_calls=2)
+    memory = MemoryStore(InMemoryBackend())
+    controller = LoopController(
+        context_engine=ContextEngine(memory),
+        prompt_compiler=PromptCompiler(role="You are a concise order-support agent."),
+        tool_gateway=ToolGateway([lookup]),
+        guardrails=GuardrailPipeline(),
+        memory=memory,
+        call_llm=make_call_llm(AsyncAnthropic(), [lookup]),
     )
 
-    print(result.stopped_reason)              # final_answer
-    print(result.final_text)                  # Order A-1001 has shipped via UPS.
-    print(result.turns_used)                  # 2
-    print(result.tool_results[0].data)        # ... 'internal_note': '[REDACTED]'
+    result = await controller.handle_turn("session-1", "Where is order A-1001?")
 
-    for record in backend.all_records():
-        print(record.metadata.get("event"), "->", record.content.replace("\n", " | "))
+    print(result.stopped_reason)        # final_answer
+    print(result.final_text)            # Order A-1001 has shipped with UPS.
+    print(result.tool_results[0].data)  # {'status': 'shipped', 'carrier': 'UPS', ...}
 
 
 asyncio.run(main())
 ```
 
-Output:
+Two round trips to the model, and you wrote neither of them. The first returns a
+`tool_use` block, so the gateway runs `lookup_order` and folds the result into the
+next prompt as history; the second sees that evidence and answers. `handle_turn`
+returns once, when `LoopController` decides the turn is over.
 
-```
-final_answer
-Order A-1001 has shipped via UPS.
-2
-{'order_id': 'A-1001', 'status': 'shipped', 'carrier': 'UPS', 'eta': '2026-08-03', 'internal_note': '[REDACTED]'}
-tool_call -> tool lookup_order succeeded: {'order_id': 'A-1001', 'status': 'shipped', 'carrier': 'UPS', 'eta': '2026-08-03', 'internal_note': '[REDACTED]'}
-turn_complete -> user: Where is order A-1001? | assistant: Order A-1001 has shipped via UPS.
-```
+### The adapter is the whole integration
 
-Two things worth noticing. The redacted field never reaches memory *or* the next
-prompt — redaction happens inside the gateway, before anything can observe the raw
-value. And there is no separate tool-history channel: the `ToolResult` is folded into
-`context.episodic`, so iteration 2 sees the evidence through the ordinary history
-section.
-
-See [`examples/order_tracking.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/order_tracking.py) for the fuller version,
-including a forced stop.
-
-## Connecting a real model
-
-The `call_llm` above is a fake — useful for understanding the loop, useless in production.
-[`examples/claude_adapter.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/claude_adapter.py) is the same agent wired to
-Claude through the Anthropic SDK, and it is the whole translation layer:
+`make_call_llm` above is the entire model-specific surface. Three mappings do all
+the work:
 
 | The model does this | The adapter returns |
 | --- | --- |
@@ -215,33 +191,34 @@ Claude through the Anthropic SDK, and it is the whole translation layer:
 | calls the `ask_user` tool | `TurnStepType.CLARIFICATION` |
 | replies with text only | `TurnStepType.FINAL` |
 
-`ask_user` is a **sentinel**: declared to the model as an ordinary tool, never registered
-with the `ToolGateway`. The adapter intercepts it, so the model asks a question through
-the same native tool-calling channel it uses to act — no parsing prose to guess whether
-an answer was really a question.
+`ask_user` is a **sentinel**: declared to the model as an ordinary tool, never
+registered with the `ToolGateway`. The adapter intercepts it, so the model asks a
+question through the same native tool-calling channel it uses to act — no parsing
+prose to guess whether an answer was really a question. See
+[`examples/claude_adapter.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/claude_adapter.py).
 
-Tool schemas are derived from the same `list[Tool]` you hand the gateway, so the two
-definitions cannot drift:
+Tool schemas are derived from the same `list[Tool]` handed to the gateway, so what
+the model is told about and what the gateway will actually run cannot drift apart.
 
-```python
-from anthropic import AsyncAnthropic
+Nothing here is Claude-specific beyond the SDK call. Any model with native tool
+calling maps the same three ways; one without it needs the adapter to parse a
+structured response instead.
 
-controller = LoopController(
-    ...,
-    tool_gateway=ToolGateway([lookup]),
-    call_llm=make_call_llm(AsyncAnthropic(), tools=[lookup]),
-)
-```
+## Examples
 
 ```bash
-pip install agent-harnessed anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-python examples/claude_adapter.py
+python examples/refund_agent.py --session naveed --trace
 ```
 
-Nothing about this is Claude-specific beyond the SDK call itself. Any model with native
-tool calling maps the same three ways; a model without it needs the adapter to parse a
-structured response instead.
+| File | What it shows |
+| --- | --- |
+| [`refund_agent.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/refund_agent.py) | **Start here.** Money on the line: three independent protections on a refund, an LLM intent classifier, and `--trace` printing every stage of the pipeline and where a turn stopped. |
+| [`sqlite_agent.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/sqlite_agent.py) | The smallest real agent — a model, a database, two tools. No intents, no guardrails, no subclassing. |
+| [`claude_adapter.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/claude_adapter.py) | The translation layer on its own, including the `ask_user` sentinel and refusal handling. |
+| [`order_tracking.py`](https://github.com/NaveedMunsif/agent-harness/blob/main/examples/order_tracking.py) | The loop with **no API key** — a local function stands in for the model, so you can watch redaction, memory write-back and a forced stop for free. |
+
+In none of them does the model write SQL. It names a tool and supplies a value;
+every statement is parameterized and lives in your code.
 
 ## Clarification: a return, not a suspension
 
@@ -251,17 +228,10 @@ question, collect an answer over whatever transport it has (HTTP request, websoc
 SMS, tomorrow), then call `handle_turn` again with that answer and the frame it got
 back. The controller keeps no state between calls beyond what you pass in.
 
-Continuing with the same `controller` as above — the message names no order, so the
-frame carries no `order_id` and the model asks instead of guessing:
-
 ```python
-controller = build_controller(InMemoryBackend())
-
 asked = await controller.handle_turn("session-1", "Can you check on my order?")
-
-assert asked.stopped_reason == "clarification_needed"
-assert asked.final_text == "Which order number should I look up?"   # plain text, unformatted
-assert asked.tool_results == []
+# asked.stopped_reason == "clarification_needed"
+# asked.final_text     == "Which order number should I look up?"
 
 # ... your transport waits here, for however long it takes ...
 
@@ -270,8 +240,7 @@ resolved = await controller.handle_turn(
     "It's A-1001 - where is it?",
     current_frame=asked.task_frame,      # hand the same frame back
 )
-
-assert resolved.stopped_reason == "final_answer"
+# resolved.stopped_reason == "final_answer"
 ```
 
 Because the intent matches and no entity conflicts, that second turn is a

@@ -1,10 +1,14 @@
-"""Tool call -> final answer, end to end. No API key required.
+"""``order_tracking.py``, paused at every step so you can watch the loop run.
 
-    python examples/order_tracking.py
+    python examples/order_tracking_stepthrough.py
 
-The "model" here is a local function that reads the compiled prompt and returns a
-typed LLMTurnStep. That is exactly the contract a real client satisfies -- swap in
-an API call and nothing else about this file changes.
+Same agent, same output -- but it prints the compiled prompt each iteration and
+waits for Enter between stages, so the order of events is something you observe
+rather than infer. Useful once, when the loop is still abstract.
+
+No API key required: the "model" is a local function that reads the compiled
+prompt and returns a typed LLMTurnStep, which is exactly the contract a real
+client satisfies.
 """
 
 from __future__ import annotations
@@ -48,6 +52,10 @@ ORDERS = {
 ORDER_ID = re.compile(r"\b([A-Z]-\d{4})\b")
 
 
+def pause(label: str) -> None:
+    input(f"\n--- [step: {label}] press Enter to continue ---")
+
+
 class SupportContextEngine(ContextEngine):
     """Real intent extraction: keyword routing plus order-number resolution.
 
@@ -79,12 +87,16 @@ async def authorize_lookup(session_id: str, arguments: dict[str, Any]) -> bool:
 
 async def lookup_order(session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
     order_id = str(arguments.get("order_id", "")).upper()
+    print(f"    [tool] lookup_order(order_id={order_id!r}) executing...")
     order = ORDERS.get(order_id)
     if order is None:
         raise LookupError(f"no such order: {order_id}")
     # internal_note is returned by the backend but never allowed out: it is named
     # in redact_fields, so the gateway scrubs it before anyone can see it.
-    return {"order_id": order_id, **order, "internal_note": "flagged for QA audit"}
+    result = {"order_id": order_id, **order, "internal_note": "flagged for QA audit"}
+    print(f"    [tool] raw result (pre-redaction): {result}")
+    pause("tool executed")
+    return result
 
 
 lookup_order_tool = Tool(
@@ -125,6 +137,10 @@ async def call_llm(prompt: CompiledPrompt) -> LLMTurnStep:
     history = prompt.sections.get("history", "")
     order_id = _extract(prompt.sections.get("task_frame", ""), "order_id")
 
+    print("\n    [llm] compiled prompt sections seen this iteration:")
+    for name, text in prompt.sections.items():
+        print(f"      {name}: {text!r}")
+
     # Second iteration: the tool result was folded into episodic history, so the
     # evidence is right there in the prompt. Answer from it -- but only from
     # evidence about *this* order. History spans earlier turns too, and grounding
@@ -139,15 +155,21 @@ async def call_llm(prompt: CompiledPrompt) -> LLMTurnStep:
             text = f"Order {order_id} has shipped with {carrier} and should arrive {eta}."
         else:
             text = f"Order {order_id} is still {status}; estimated delivery is {eta}."
+        print(f"    [llm] decision: FINAL -> {text!r}")
+        pause("llm decided FINAL")
         return LLMTurnStep(step_type=TurnStepType.FINAL, text=text)
 
     # First iteration: no usable evidence yet, so ask for a lookup.
     if order_id:
+        print(f"    [llm] decision: TOOL_CALL -> lookup_order(order_id={order_id!r})")
+        pause("llm decided TOOL_CALL")
         return LLMTurnStep(
             step_type=TurnStepType.TOOL_CALL,
             tool_name="lookup_order",
             tool_arguments={"order_id": order_id},
         )
+    print("    [llm] decision: CLARIFICATION (no order id found)")
+    pause("llm decided CLARIFICATION")
     return LLMTurnStep(
         step_type=TurnStepType.CLARIFICATION,
         text="Which order number should I look up?",
@@ -209,6 +231,7 @@ async def main() -> None:
 
     message = "Hi, where is my order A-1001?"
     print(f"\nuser: {message}\n")
+    pause("about to call handle_turn (this runs the whole loop below)")
 
     result = await controller.handle_turn(
         SESSION,
@@ -226,6 +249,7 @@ async def main() -> None:
     print(f"entities       : {result.task_frame.entities}")
     for tool_result in result.tool_results:
         print(f"tool           : {tool_result.tool_name} ok={tool_result.ok} {tool_result.data}")
+    pause("turn finished, about to inspect episodic memory")
 
     print("\n--- episodic memory after the turn " + "-" * 34)
     # Two records: the granular tool call (written the moment it completed) and
@@ -236,6 +260,7 @@ async def main() -> None:
         event = record.metadata.get("event")
         body = record.content.replace("\n", " | ")
         print(f"[{event}] {body}")
+    pause("about to run the forced-stop scenario (max_tool_calls=0)")
 
     print("\n--- a forced stop still records what already ran " + "-" * 21)
     # max_tool_calls=0 stops before the first lookup; note there is no answer and
