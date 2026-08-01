@@ -298,11 +298,31 @@ async def test_forced_stop_skips_the_output_formatter():
 # ------------------------------------------------------ repeated-call detection
 
 
-async def test_an_identical_repeated_proposal_stops_the_loop():
+async def test_a_repeated_proposal_is_corrected_rather_than_ending_the_turn():
     harness = build_harness(
         steps=[
             tool_call("lookup_order", order_id="A-1"),
+            tool_call("lookup_order", order_id="A-1"),  # repeat: corrected
+            final("Order A-1 has shipped."),
+        ],
+        tools=[lookup_order_tool()],
+    )
+
+    result = await harness.controller.handle_turn(SESSION, "track order=A-1")
+
+    assert result.stopped_reason == "final_answer"
+    assert result.final_text == "Order A-1 has shipped."
+    # The repeat never executed, so there is still exactly one result.
+    assert len(result.tool_results) == 1
+    assert harness.episodic_events() == ["tool_call", "turn_complete"]
+
+
+async def test_a_repeat_after_the_correction_stops_the_loop():
+    harness = build_harness(
+        steps=[
             tool_call("lookup_order", order_id="A-1"),
+            tool_call("lookup_order", order_id="A-1"),  # corrected
+            tool_call("lookup_order", order_id="A-1"),  # still looping: stop
             final("never reached"),
         ],
         tools=[lookup_order_tool()],
@@ -312,9 +332,25 @@ async def test_an_identical_repeated_proposal_stops_the_loop():
 
     assert result.stopped_reason == "repeated_call_detected"
     assert result.final_text is None
-    # The first call ran and is recorded; the second never executed.
     assert len(result.tool_results) == 1
     assert harness.episodic_events() == ["tool_call", "forced_stop"]
+
+
+async def test_the_correction_reaches_the_next_prompt():
+    harness = build_harness(
+        steps=[
+            tool_call("lookup_order", order_id="A-1"),
+            tool_call("lookup_order", order_id="A-1"),
+            final("Order A-1 has shipped."),
+        ],
+        tools=[lookup_order_tool()],
+    )
+
+    await harness.controller.handle_turn(SESSION, "track order=A-1")
+
+    # The third compile is the one that happened after the correction was
+    # appended, so the model can see it before answering.
+    assert "was already called this turn" in harness.llm.prompts[-1].sections["history"]
 
 
 async def test_argument_order_does_not_disguise_a_repeat():
@@ -322,6 +358,7 @@ async def test_argument_order_does_not_disguise_a_repeat():
         steps=[
             tool_call("lookup_order", order_id="A-1", carrier="ups"),
             tool_call("lookup_order", carrier="ups", order_id="A-1"),
+            tool_call("lookup_order", order_id="A-1", carrier="ups"),
         ],
         tools=[lookup_order_tool()],
     )
@@ -357,6 +394,11 @@ async def test_non_json_native_arguments_do_not_raise_a_type_error():
     }
     harness = build_harness(
         steps=[
+            LLMTurnStep(
+                step_type=TurnStepType.TOOL_CALL,
+                tool_name="lookup_order",
+                tool_arguments=dict(exotic),
+            ),
             LLMTurnStep(
                 step_type=TurnStepType.TOOL_CALL,
                 tool_name="lookup_order",

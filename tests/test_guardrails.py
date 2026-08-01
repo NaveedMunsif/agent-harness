@@ -6,6 +6,7 @@ import pytest
 
 from agent_harness import (
     Guardrail,
+    LoopLimits,
     GuardrailPipeline,
     GuardrailStage,
     GuardrailViolation,
@@ -302,3 +303,71 @@ async def test_an_evidence_grounding_guardrail_is_expressible_on_the_output_payl
     assert (
         await ungrounded.controller.handle_turn(SESSION, "track order=A-1")
     ).stopped_reason == "guardrail_violation:output"
+
+
+# ------------------------------------------------- the reason reaches the caller
+
+
+async def test_a_violation_carries_its_reason_to_the_caller():
+    # stopped_reason names only the stage. Without this the reason exists solely
+    # inside an exception the loop has already caught, so a caller wanting to
+    # tell a user *why* would have to wrap every guardrail itself.
+    def refuse(payload) -> None:
+        raise GuardrailViolation(GuardrailStage.TOOL, "refund of $800 exceeds the $500 limit")
+
+    harness = build_harness(
+        steps=[tool_call("lookup_order", order_id="A-1")],
+        tools=[lookup_order_tool()],
+        guardrails=[Guardrail("ceiling", GuardrailStage.TOOL, refuse)],
+    )
+
+    result = await harness.controller.handle_turn(SESSION, "track order=A-1")
+
+    assert result.stopped_reason == "guardrail_violation:tool"
+    assert result.violation_reason == "refund of $800 exceeds the $500 limit"
+    assert result.final_text is None
+
+
+@pytest.mark.parametrize(
+    "stage, message",
+    [
+        (GuardrailStage.INPUT, "message too long"),
+        (GuardrailStage.CONTEXT, "context too large"),
+    ],
+)
+async def test_the_reason_survives_from_every_stage(stage, message):
+    def refuse(payload) -> None:
+        raise GuardrailViolation(stage, message)
+
+    harness = build_harness(
+        steps=[final("never reached")],
+        guardrails=[Guardrail("g", stage, refuse)],
+    )
+
+    result = await harness.controller.handle_turn(SESSION, "track order=A-1")
+
+    assert result.violation_reason == message
+
+
+async def test_violation_reason_is_none_when_no_guardrail_fired():
+    harness = build_harness(steps=[final("All good.")])
+
+    result = await harness.controller.handle_turn(SESSION, "track order=A-1")
+
+    assert result.stopped_reason == "final_answer"
+    assert result.violation_reason is None
+
+
+async def test_violation_reason_is_none_on_a_forced_stop():
+    # A budget breach is not a guardrail refusal, so there is no reason to carry.
+    harness = build_harness(
+        steps=[tool_call("lookup_order", order_id="A-1")],
+        tools=[lookup_order_tool()],
+    )
+
+    result = await harness.controller.handle_turn(
+        SESSION, "track order=A-1", limits=LoopLimits(max_tool_calls=0)
+    )
+
+    assert result.stopped_reason == "max_tool_calls_exceeded"
+    assert result.violation_reason is None

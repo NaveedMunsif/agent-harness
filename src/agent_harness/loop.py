@@ -113,6 +113,9 @@ class LoopBudget:
     turns: int = 0
     tool_calls: int = 0
     seen_proposals: set[tuple[str, str]] = field(default_factory=set)
+    #: Proposals the model has already been told it repeated. A repeat is worth
+    #: one correction before it counts as a loop -- see ``warn_repeat``.
+    warned_proposals: set[tuple[str, str]] = field(default_factory=set)
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -135,20 +138,39 @@ class LoopBudget:
     def record_tool_call(self) -> None:
         self.tool_calls += 1
 
-    def register_proposal(self, proposal: ToolProposal) -> bool:
-        """Record ``proposal``; return ``True`` if an identical one was already seen.
+    @staticmethod
+    def proposal_key(proposal: ToolProposal) -> tuple[str, str]:
+        """Canonical identity of a proposal: its name plus its sorted arguments.
 
         ``default=str`` keeps arguments containing ``datetime``, ``UUID`` or
         ``Decimal`` from raising ``TypeError`` during canonicalization.
         """
-        key = (
+        return (
             proposal.tool_name,
             json.dumps(proposal.arguments, sort_keys=True, default=str),
         )
+
+    def register_proposal(self, proposal: ToolProposal) -> bool:
+        """Record ``proposal``; return ``True`` if an identical one was already seen."""
+        key = self.proposal_key(proposal)
         if key in self.seen_proposals:
             return True
         self.seen_proposals.add(key)
         return False
+
+    def warn_repeat(self, proposal: ToolProposal) -> bool:
+        """``True`` the first time this exact repeat is reported, ``False`` after.
+
+        A model that asks for the same call twice is usually stuck rather than
+        looping -- it wanted something the result did not contain and looked
+        again. Telling it so is more useful than ending the turn, so the first
+        repeat buys a correction. A second one is a loop, and the caller stops.
+        """
+        key = self.proposal_key(proposal)
+        if key in self.warned_proposals:
+            return False
+        self.warned_proposals.add(key)
+        return True
 
 
 @dataclass
@@ -163,6 +185,12 @@ class LoopResult:
     ``"max_seconds_exceeded"``, ``"repeated_call_detected"``, or
     ``f"guardrail_violation:{stage}"`` for a stage in
     ``{input, context, tool, output}``.
+
+    ``violation_reason`` carries the ``GuardrailViolation.reason`` when a
+    guardrail ended the turn, and is ``None`` otherwise. It exists because
+    ``stopped_reason`` names only the *stage*: a caller that wants to tell a user
+    why they were refused would otherwise have to wrap every guardrail itself,
+    since a violation aborts before any ``ToolResult`` is recorded.
     """
 
     final_text: str | None
@@ -170,6 +198,7 @@ class LoopResult:
     tool_results: list[ToolResult]
     turns_used: int
     stopped_reason: str
+    violation_reason: str | None = None
 
 
 class LoopController:
@@ -259,6 +288,23 @@ class LoopController:
                     )
 
                     if budget.register_proposal(proposal):
+                        # Correct the model once rather than ending the turn on
+                        # the spot. The result it is asking for again is already
+                        # in this context, so saying so lets it answer from what
+                        # it has; killing the turn leaves the caller with
+                        # ``final_text=None`` and a user with nothing. The note
+                        # goes into episodic context, the same channel every
+                        # other piece of evidence arrives through. No tool runs,
+                        # so no budget is spent, and ``max_turns`` still bounds
+                        # the whole exchange.
+                        if budget.warn_repeat(proposal):
+                            context.episodic.append(
+                                f"tool {proposal.tool_name} was already called this "
+                                f"turn with exactly these arguments; its result is "
+                                f"above. Answer from it, or do something different -- "
+                                f"calling it again will return the same thing."
+                            )
+                            continue
                         return await self._forced_stop(
                             session_id,
                             "repeated_call_detected",
@@ -350,6 +396,7 @@ class LoopController:
                 tool_results=tool_results,
                 turns_used=budget.turns,
                 stopped_reason=reason,
+                violation_reason=violation.reason,
             )
 
     async def _forced_stop(

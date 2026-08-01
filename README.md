@@ -68,6 +68,14 @@ A model can emit `final` on every turn; the loop still ends only when `LoopContr
 says so. The OUTPUT guardrail is skipped for a clarification because **a question is not
 a claim** — there is nothing to ground it against.
 
+`repeated_call_detected` is the one exit the loop tries to avoid reaching. A model that
+proposes the same call twice is usually *stuck* rather than looping — it wanted
+something the result did not contain and looked again. So the first repeat appends a
+correction to episodic context (*"you already called this; its result is above"*) and
+the turn continues; no tool runs and no budget is spent. Only a second identical
+proposal, after that correction, ends the turn. The alternative — stopping on the first
+repeat — hands the caller `final_text=None` when the answer was already in hand.
+
 ### Guardrail payload contract
 
 Each stage's `check()` receives exactly one type, so guardrails are written against
@@ -83,6 +91,43 @@ concrete objects rather than an untyped blob:
 A violation never reaches your process: `LoopController` catches `GuardrailViolation`,
 records it, and returns a clean `LoopResult` with `final_text=None`. Output guardrails
 must fail safe when evidence is missing, not crash the caller.
+
+The reason survives the catch. `stopped_reason` names only the stage, so `LoopResult`
+also carries `violation_reason` — otherwise the one sentence explaining the refusal
+would exist solely inside an exception you never see:
+
+```python
+if result.violation_reason:
+    print(result.violation_reason)   # "refund of $800.00 exceeds the $500.00 limit"
+```
+
+### The gateway can explain itself
+
+`Tool.authorize` may return `True`, `False`, or **a string** — a string refuses *and*
+supplies the reason. It matters more than it looks: a bare `False` produces only
+"authorization declined", which a model reads as a transient error and retries, and a
+user reads as nothing at all.
+
+```python
+async def authorize_refund(session_id: str, arguments: dict) -> bool | str:
+    order = fetch(arguments["order_id"])
+    if order is None or order["customer"] != customer_for(session_id):
+        return "that order is not on this account"
+    return True
+```
+
+Allowlisting, rate limiting and redaction have no callable to wrap, so they are
+invisible from outside — a rate-limited call and a call that was never proposed look
+identical in a `LoopResult`. Pass `on_event` to see them:
+
+```python
+gateway = ToolGateway(tools, on_event=lambda e: print(e.stage, e.tool_name, e.ok))
+# authorize     issue_refund True
+# rate_limit    issue_refund False
+```
+
+Each event is a `GatewayEvent` with `stage` (`allowlist`, `authorize`, `rate_limit`,
+`execute`), `tool_name`, `session_id`, `ok` and an optional `detail`.
 
 ## A complete agent, wired to a real model
 
@@ -301,10 +346,13 @@ cut short. A resolved turn never loses that granularity either: the consolidated
 pytest
 ```
 
-99 tests covering tool authorization/redaction/rate-limiting, pivot-vs-continuation
+116 tests covering tool authorization/redaction/rate-limiting, pivot-vs-continuation
 semantics and the `fresh()`/`merged_with()` branch in `ContextEngine.build`, all three
 loop exits, every forced stop (including that already-executed `ToolResult`s survive
-one), guardrail violations converting to clean results at each stage, `LLMTurnStep`
-validation rejecting malformed steps, repeated-call detection over non-JSON-native
-arguments, the per-stage guardrail payload contract, and that the topic-change note
-reaches the prompt on a real pivot but never on a session's opening message.
+one), guardrail violations converting to clean results at each stage — carrying their
+reason — `LLMTurnStep` validation rejecting malformed steps, repeated-call detection
+over non-JSON-native arguments, a repeat being corrected once before it ends a turn,
+`authorize` refusing with a string (and a *truthy* string still refusing), a
+`GatewayEvent` for every gateway decision including the two that have no callable to
+wrap, the per-stage guardrail payload contract, and that the topic-change note reaches
+the prompt on a real pivot but never on a session's opening message.

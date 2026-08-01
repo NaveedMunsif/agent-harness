@@ -223,3 +223,135 @@ async def test_result_carries_the_originating_proposal_id():
     proposal = ToolProposal("lookup_order", {})
     result = await gateway_with(lookup_order_tool()).execute(SESSION, proposal)
     assert result.proposal_id == proposal.id
+
+
+# --------------------------------------------------- authorize with a reason
+
+
+async def test_a_string_verdict_refuses_and_carries_its_reason():
+    async def deny(session_id: str, arguments: dict) -> str:
+        return f"order {arguments['order_id']} is not on this account"
+
+    tool = lookup_order_tool(authorize=deny)
+
+    with pytest.raises(ToolAuthorizationFailed) as excinfo:
+        await gateway_with(tool).execute(
+            SESSION, ToolProposal("lookup_order", {"order_id": "A-1"})
+        )
+
+    assert str(excinfo.value) == "order A-1 is not on this account"
+    assert tool.calls == []
+
+
+async def test_a_truthy_string_is_still_a_refusal():
+    # The trap this guards: every non-empty string is truthy, so a gateway that
+    # checked `if not verdict` first would read "denied: not yours" as approval.
+    async def deny(session_id: str, arguments: dict) -> str:
+        return "denied: not yours"
+
+    tool = lookup_order_tool(authorize=deny)
+
+    with pytest.raises(ToolAuthorizationFailed):
+        await gateway_with(tool).execute(SESSION, ToolProposal("lookup_order", {}))
+
+    assert tool.calls == []
+
+
+async def test_an_empty_string_refuses_with_the_generic_reason():
+    async def deny(session_id: str, arguments: dict) -> str:
+        return ""
+
+    with pytest.raises(ToolAuthorizationFailed) as excinfo:
+        await gateway_with(lookup_order_tool(authorize=deny)).execute(
+            SESSION, ToolProposal("lookup_order", {})
+        )
+
+    assert "authorization declined" in str(excinfo.value)
+
+
+async def test_bool_verdicts_are_unchanged():
+    async def allow(session_id: str, arguments: dict) -> bool:
+        return True
+
+    result = await gateway_with(lookup_order_tool(authorize=allow)).execute(
+        SESSION, ToolProposal("lookup_order", {})
+    )
+    assert result.ok is True
+
+
+# ------------------------------------------------------------- gateway events
+
+
+def recording_gateway(tool: Tool) -> tuple[ToolGateway, list]:
+    seen: list = []
+    gateway = ToolGateway([tool], on_event=seen.append)
+    return gateway, seen
+
+
+async def test_a_successful_call_reports_authorize_and_execute():
+    async def allow(session_id: str, arguments: dict) -> bool:
+        return True
+
+    gateway, seen = recording_gateway(lookup_order_tool(authorize=allow))
+    await gateway.execute(SESSION, ToolProposal("lookup_order", {"order_id": "A-1"}))
+
+    assert [(e.stage, e.ok) for e in seen] == [("authorize", True), ("execute", True)]
+    assert all(e.tool_name == "lookup_order" and e.session_id == SESSION for e in seen)
+
+
+async def test_a_refused_call_reports_the_stage_that_refused_it():
+    async def deny(session_id: str, arguments: dict) -> str:
+        return "not yours"
+
+    gateway, seen = recording_gateway(lookup_order_tool(authorize=deny))
+    with pytest.raises(ToolAuthorizationFailed):
+        await gateway.execute(SESSION, ToolProposal("lookup_order", {}))
+
+    assert [(e.stage, e.ok, e.detail) for e in seen] == [
+        ("authorize", False, "not yours")
+    ]
+
+
+async def test_rate_limiting_is_observable():
+    # The point of the hook: rate limiting has no callable to wrap, so without
+    # it a rate-limited call is indistinguishable from one never proposed.
+    gateway, seen = recording_gateway(lookup_order_tool(max_calls_per_session=1))
+
+    await gateway.execute(SESSION, ToolProposal("lookup_order", {"n": 1}))
+    with pytest.raises(ToolRateLimited):
+        await gateway.execute(SESSION, ToolProposal("lookup_order", {"n": 2}))
+
+    assert [(e.stage, e.ok) for e in seen] == [
+        ("rate_limit", True),
+        ("execute", True),
+        ("rate_limit", False),
+    ]
+    assert "1 call(s) per session" in seen[-1].detail
+
+
+async def test_an_unknown_tool_reports_the_allowlist_stage():
+    gateway = ToolGateway([], on_event=(seen := []).append)
+
+    with pytest.raises(ToolNotAllowed):
+        await gateway.execute(SESSION, ToolProposal("nope", {}))
+
+    assert [(e.stage, e.ok) for e in seen] == [("allowlist", False)]
+
+
+async def test_a_failing_tool_reports_execute_false_with_the_error():
+    async def boom(session_id: str, arguments: dict) -> dict:
+        raise RuntimeError("backend down")
+
+    tool = Tool(name="lookup_order", description="d", parameters=[], execute=boom)
+    gateway, seen = recording_gateway(tool)
+    result = await gateway.execute(SESSION, ToolProposal("lookup_order", {}))
+
+    assert result.ok is False
+    assert [(e.stage, e.ok) for e in seen] == [("execute", False)]
+    assert seen[0].detail == "RuntimeError: backend down"
+
+
+async def test_no_hook_means_no_overhead_and_no_change():
+    gateway = ToolGateway([lookup_order_tool()])
+    result = await gateway.execute(SESSION, ToolProposal("lookup_order", {}))
+    assert result.ok is True

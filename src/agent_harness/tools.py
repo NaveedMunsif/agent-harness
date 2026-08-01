@@ -31,13 +31,18 @@ __all__ = [
     "ToolAuthorizationFailed",
     "ToolRateLimited",
     "ToolGateway",
+    "GatewayEvent",
     "REDACTED",
 ]
 
 REDACTED = "[REDACTED]"
 
 ExecuteFn = Callable[[str, dict[str, Any]], Awaitable[Any]]
-AuthorizeFn = Callable[[str, dict[str, Any]], Awaitable[bool]]
+#: Return ``True`` to allow, ``False`` to refuse, or a **string** to refuse with
+#: that string as the reason. A bare ``False`` can only ever produce a generic
+#: "authorization declined", which tells neither the caller nor a model *why* --
+#: and an unexplained refusal reads like a transient error worth retrying.
+AuthorizeFn = Callable[[str, dict[str, Any]], Awaitable["bool | str"]]
 
 
 def _utcnow() -> datetime:
@@ -88,6 +93,30 @@ class ToolResult:
     executed_at: datetime = field(default_factory=_utcnow)
 
 
+@dataclass
+class GatewayEvent:
+    """One decision the gateway made on its way to running a tool.
+
+    Three of the gateway's four jobs -- allowlisting, rate limiting, redaction --
+    have no callable you can wrap, so from the outside they are invisible: a
+    rate-limited call and a call that was never proposed look the same in a
+    ``LoopResult``. Passing ``on_event`` to :class:`ToolGateway` makes each
+    decision observable without changing what the gateway does.
+
+    ``stage`` is one of ``"allowlist"``, ``"authorize"``, ``"rate_limit"`` or
+    ``"execute"``. ``ok`` reports whether that stage let the call proceed.
+    """
+
+    stage: str
+    tool_name: str
+    session_id: str
+    ok: bool
+    detail: str | None = None
+
+
+GatewayHook = Callable[[GatewayEvent], None]
+
+
 class ToolError(Exception):
     """Base class for policy refusals raised before a tool runs."""
 
@@ -105,13 +134,34 @@ class ToolRateLimited(ToolError):
 
 
 class ToolGateway:
-    """Registry plus enforcement point for tool execution."""
+    """Registry plus enforcement point for tool execution.
 
-    def __init__(self, tools: list[Tool] | None = None) -> None:
+    ``on_event`` receives a :class:`GatewayEvent` for every decision made here.
+    It is called synchronously and its return value is ignored; an exception
+    raised inside it will propagate, so keep it to recording.
+    """
+
+    def __init__(
+        self,
+        tools: list[Tool] | None = None,
+        on_event: GatewayHook | None = None,
+    ) -> None:
         self._tools: dict[str, Tool] = {}
         self._call_counts: dict[tuple[str, str], int] = {}
+        self._on_event = on_event
         for tool in tools or []:
             self.register(tool)
+
+    def _emit(
+        self,
+        stage: str,
+        tool_name: str,
+        session_id: str,
+        ok: bool,
+        detail: str | None = None,
+    ) -> None:
+        if self._on_event is not None:
+            self._on_event(GatewayEvent(stage, tool_name, session_id, ok, detail))
 
     def register(self, tool: Tool) -> Tool:
         """Register (or replace) a tool by name. Returns the tool."""
@@ -153,24 +203,39 @@ class ToolGateway:
         """
         tool = self._tools.get(proposal.tool_name)
         if tool is None:
-            raise ToolNotAllowed(f"unknown tool: {proposal.tool_name!r}")
+            reason = f"unknown tool: {proposal.tool_name!r}"
+            self._emit("allowlist", proposal.tool_name, session_id, False, reason)
+            raise ToolNotAllowed(reason)
 
         if allowlist is not None and proposal.tool_name not in set(allowlist):
-            raise ToolNotAllowed(f"tool not in allowlist: {proposal.tool_name!r}")
+            reason = f"tool not in allowlist: {proposal.tool_name!r}"
+            self._emit("allowlist", tool.name, session_id, False, reason)
+            raise ToolNotAllowed(reason)
 
         if tool.authorize is not None:
-            if not await tool.authorize(session_id, proposal.arguments):
-                raise ToolAuthorizationFailed(
+            verdict = await tool.authorize(session_id, proposal.arguments)
+            # A string is a refusal *carrying its reason*. Tested before
+            # truthiness on purpose: every non-empty string is truthy, so
+            # checking ``if not verdict`` first would let "not your order"
+            # through as an approval.
+            if isinstance(verdict, str) or not verdict:
+                reason = verdict if isinstance(verdict, str) and verdict else (
                     f"authorization declined for {proposal.tool_name!r}"
                 )
+                self._emit("authorize", tool.name, session_id, False, reason)
+                raise ToolAuthorizationFailed(reason)
+            self._emit("authorize", tool.name, session_id, True)
 
         key = (session_id, tool.name)
         if tool.max_calls_per_session is not None:
             if self._call_counts.get(key, 0) >= tool.max_calls_per_session:
-                raise ToolRateLimited(
+                reason = (
                     f"{proposal.tool_name!r} exceeded "
                     f"{tool.max_calls_per_session} call(s) per session"
                 )
+                self._emit("rate_limit", tool.name, session_id, False, reason)
+                raise ToolRateLimited(reason)
+            self._emit("rate_limit", tool.name, session_id, True)
 
         # Counted at dispatch, not on success: a call that errored partway may
         # still have caused side effects, so it must consume budget.
@@ -179,13 +244,16 @@ class ToolGateway:
         try:
             data = await tool.execute(session_id, proposal.arguments)
         except Exception as exc:  # noqa: BLE001 - surfaced as failed evidence
+            error = f"{type(exc).__name__}: {exc}"
+            self._emit("execute", tool.name, session_id, False, error)
             return ToolResult(
                 proposal_id=proposal.id,
                 tool_name=tool.name,
                 ok=False,
-                error=f"{type(exc).__name__}: {exc}",
+                error=error,
             )
 
+        self._emit("execute", tool.name, session_id, True)
         return ToolResult(
             proposal_id=proposal.id,
             tool_name=tool.name,

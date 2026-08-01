@@ -54,7 +54,7 @@ import pathlib
 import re
 import sqlite3
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 from anthropic import AsyncAnthropic
@@ -78,6 +78,7 @@ from agent_harness import (  # noqa: E402
     MemoryStore,
     PromptCompiler,
     Tool,
+    GatewayEvent,
     ToolGateway,
     ToolProposal,
     ToolResult,
@@ -156,26 +157,28 @@ def fetch_order(order_id: str) -> sqlite3.Row | None:
 
 
 # --- the tools ---------------------------------------------------------------
-async def get_order(session_id: str, arguments: dict) -> dict:
-    """One order, if it belongs to this customer.
+async def authorize_read(session_id: str, arguments: dict) -> bool | str:
+    """You may only read an order that is yours.
 
-    The ownership check sits here rather than in ``authorize`` because
-    ``authorize`` returns a bare ``bool``: the gateway can only say
-    "authorization declined", which the model reads as transient and retries.
-    Raising from ``execute`` gives it a sentence to relay instead.
-    ``issue_refund`` keeps ``authorize``, where the refusal is the point.
+    Reads need this as much as writes do: without it, anyone who guesses an id
+    sees another customer's item and total. Easy to forget precisely because
+    ``read_only=True`` reads as harmless.
+
+    Missing and not-yours are refused in the same words, for the same reason as
+    :func:`authorize_refund` -- different wording is an enumeration oracle.
     """
-    order_id = str(arguments["order_id"]).upper()
-    row = fetch_order(order_id)
-    if row is None:
-        raise LookupError(f"no order with id {order_id}")
     customer = SESSIONS.get(session_id)
-    if row["customer"] != customer:
-        raise PermissionError(
-            f"order {order_id} belongs to a different customer and cannot be "
-            "viewed from this account"
-        )
-    return dict(row)
+    if customer is None:
+        return "this session is not signed in"
+    row = fetch_order(str(arguments.get("order_id", "")))
+    if row is None or row["customer"] != customer:
+        return "that order is not on this account"
+    return True
+
+
+async def get_order(session_id: str, arguments: dict) -> dict:
+    """One order. Ownership is settled by ``authorize_read`` before this runs."""
+    return dict(fetch_order(str(arguments["order_id"]).upper()))
 
 
 async def orders_by_status(session_id: str, arguments: dict) -> dict:
@@ -263,23 +266,27 @@ async def issue_refund(session_id: str, arguments: dict) -> dict:
     }
 
 
-async def authorize_refund(session_id: str, arguments: dict) -> bool:
+async def authorize_refund(session_id: str, arguments: dict) -> bool | str:
     """Protection 1: you may only refund an order that is yours.
 
     This is why ``authorize`` takes ``session_id`` rather than reading it out of
     ``arguments``: the customer identity comes from the session the harness was
     called with, so a model that puts ``"customer": "Omar"`` in its arguments
-    cannot promote itself. Returning ``False`` raises ``ToolAuthorizationFailed``
-    and ``execute`` never runs.
+    cannot promote itself.
+
+    Returning a string refuses *and* explains. A bare ``False`` can only produce
+    "authorization declined", which a model reads as transient and retries.
     """
     customer = SESSIONS.get(session_id)
     if customer is None:
-        return False
+        return "this session is not signed in"
     row = fetch_order(str(arguments.get("order_id", "")))
-    # "Does not exist" and "belongs to someone else" are refused identically:
-    # different wording lets anyone walk the id space to find real orders. Log
-    # the distinction here if you need it; never put it in the reply.
-    return row is not None and row["customer"] == customer
+    # "Does not exist" and "belongs to someone else" are refused in the same
+    # words: different wording lets anyone walk the id space to find real orders.
+    # Log the distinction here if you need it; never put it in the reply.
+    if row is None or row["customer"] != customer:
+        return "that order is not on this account"
+    return True
 
 
 TOOLS = [
@@ -300,6 +307,7 @@ TOOLS = [
         description="Get one order's full details by its id, e.g. A-1001.",
         parameters=["order_id"],
         execute=get_order,
+        authorize=authorize_read,
         read_only=True,
         max_calls_per_session=20,
     ),
@@ -524,38 +532,18 @@ class TracingPromptCompiler(PromptCompiler):
         return prompt
 
 
-def traced_tool(tool: Tool) -> Tool:
-    """A copy of ``tool`` whose authorize and execute report what they did.
+def on_gateway_event(event: GatewayEvent) -> None:
+    """Record every decision the gateway makes.
 
-    ``max_calls_per_session`` is enforced by the gateway between the two with no
-    callable to wrap, so ``render_trace`` names that gap rather than leave a hole.
+    This replaces wrapping ``authorize`` and ``execute`` by hand. It also covers
+    the two stages that have no callable to wrap at all -- allowlisting and the
+    per-session rate limit -- which previously had to be guessed at from the
+    error string on a failed ``ToolResult``.
     """
-    original_authorize = tool.authorize
-    original_execute = tool.execute
-
-    async def authorize(session_id: str, arguments: dict) -> bool:
-        allowed = await original_authorize(session_id, arguments)
-        trace(
-            "authorize",
-            f"{tool.name}: {'allowed' if allowed else 'DENIED'}",
-            "ok" if allowed else "fail",
-        )
-        return allowed
-
-    async def execute(session_id: str, arguments: dict):
-        try:
-            data = await original_execute(session_id, arguments)
-        except Exception as exc:
-            trace("execute", f"{tool.name}: {type(exc).__name__}: {exc}", "fail")
-            raise
-        trace("execute", f"{tool.name}: ran")
-        return data
-
-    return replace(
-        tool,
-        authorize=authorize if original_authorize is not None else None,
-        execute=execute,
+    detail = f"{event.tool_name}: {event.detail}" if event.detail else (
+        f"{event.tool_name}: {'ok' if event.ok else 'refused'}"
     )
+    trace(event.stage, detail, "ok" if event.ok else "fail")
 
 
 def render_trace(result: LoopResult) -> str:
@@ -564,13 +552,6 @@ def render_trace(result: LoopResult) -> str:
     lines = ["   " + "-" * 66, "   how the turn went"]
     for event in TRACE:
         lines.append(f"   {marks[event.status]:>4}  {event.stage:<18} {event.detail}")
-
-    # The one stage with no callable to wrap: the gateway's own rate limit sits
-    # between authorize and execute, so its refusal leaves a gap in the trace.
-    if any(
-        r.error and r.error.startswith("ToolRateLimited") for r in result.tool_results
-    ):
-        lines.append(f"   {'STOP':>4}  {'rate limit':<18} per-session budget spent")
 
     lines.append(f"   {'==':>4}  {'stopped':<18} {result.stopped_reason}")
     lines.append("   " + "-" * 66)
@@ -677,7 +658,7 @@ def build_controller(
     backend: InMemoryBackend,
     tools: list[Tool] | None = None,
 ) -> LoopController:
-    tools = [traced_tool(t) for t in (TOOLS if tools is None else tools)]
+    tools = TOOLS if tools is None else tools
     memory = TracingMemoryStore(backend)
 
     guardrails = GuardrailPipeline()
@@ -704,7 +685,7 @@ def build_controller(
     return LoopController(
         context_engine=RefundContext(memory, client),
         prompt_compiler=TracingPromptCompiler(role=ROLE),
-        tool_gateway=ToolGateway(tools),
+        tool_gateway=ToolGateway(tools, on_event=on_gateway_event),
         guardrails=guardrails,
         memory=memory,
         # The gateway and the adapter are handed the same list, so the two
@@ -811,12 +792,11 @@ WRITE_TOOLS = {tool.name for tool in TOOLS if not tool.read_only}
 
 # Keyed by exception class name, which is what LoopController puts in front of
 # the colon when it converts a ToolError into a failed ToolResult.
+# ``ToolAuthorizationFailed`` is deliberately absent: ``authorize`` now returns
+# its own reason, so the error already carries a sentence written for a customer.
+# Mapping it here would replace that with something vaguer. What remains are the
+# refusals the gateway phrases itself, in its own technical terms.
 _GATEWAY_REFUSALS = {
-    # Must read the same for a missing order and someone else's -- see
-    # authorize_refund.
-    "ToolAuthorizationFailed": (
-        "I can't find that order on your account. Please check the order id."
-    ),
     "ToolRateLimited": (
         "You have reached the refund limit for this session. "
         "Customer service can help with anything further."
@@ -871,14 +851,9 @@ def describe_stop(result: LoopResult) -> str:
                 "Customer service can help with anything beyond it."
             )
 
+    if result.violation_reason:
+        return result.violation_reason
     if result.stopped_reason.startswith("guardrail_violation"):
-        # LoopResult carries the stage but not the reason, and a violation
-        # aborts the turn so there is no ToolResult either. The traced guardrail
-        # recorded it on the way past.
-        for event in reversed(TRACE):
-            if event.status == "fail" and event.stage.endswith("guardrail"):
-                _, _, reason = event.detail.partition(": ")
-                return (reason or event.detail).strip()
         stage = result.stopped_reason.split(":", 1)[-1]
         return f"That request was refused by a {stage} policy check."
     if result.stopped_reason.endswith("_exceeded"):

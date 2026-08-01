@@ -38,6 +38,7 @@ from .prompt import CompiledPrompt, PromptCompiler
 from .state import TaskFrame
 from .tools import (
     REDACTED,
+    GatewayEvent,
     Tool,
     ToolAuthorizationFailed,
     ToolError,
@@ -48,7 +49,7 @@ from .tools import (
     ToolResult,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     # state
@@ -70,6 +71,7 @@ __all__ = [
     "ToolProposal",
     "ToolResult",
     "ToolGateway",
+    "GatewayEvent",
     "ToolError",
     "ToolNotAllowed",
     "ToolAuthorizationFailed",
